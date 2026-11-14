@@ -146,3 +146,43 @@ export function getNativeTaskbarLyric(): NativeTaskbarLyric | null {
   }
   return taskbarLyric ?? null;
 }
+
+export interface NativeWallpaperOcclusion {
+  coverage: number;
+  fullscreen: boolean;
+}
+
+export interface NativeWallpaperMonitor {
+  setInterval(intervalMs: number): void;
+  stop(): void;
+}
+
+export interface NativeWallpaper {
+  wallpaperAttach(handle: string): string;
+  wallpaperResize(handle: string, x: number, y: number, width: number, height: number): void;
+  wallpaperDetach(handle: string): void;
+  WallpaperMonitor: new (
+    handle: string,
+    intervalMs: number,
+    callback: (state: NativeWallpaperOcclusion) => void,
+  ) => NativeWallpaperMonitor;
+}
+
+let wallpaper: NativeWallpaper | null | undefined;
+export function getNativeWallpaper(): NativeWallpaper | null {
+  if (wallpaper !== undefined) return wallpaper;
+  wallpaper = null;
+  if (process.platform !== 'win32') return null;
+  try {
+    const candidate = loadAddon();
+    if (
+      typeof candidate.wallpaperAttach !== 'function' ||
+      typeof candidate.WallpaperMonitor !== 'function'
+    )
+      throw new Error('Rebuild echo-platform-adaptor for the desktop wallpaper');
+    wallpaper = candidate as unknown as NativeWallpaper;
+  } catch (error) {
+    log.warn('[NativePlatform] Wallpaper unavailable:', error);
+  }
+  return wallpaper ?? null;
+}

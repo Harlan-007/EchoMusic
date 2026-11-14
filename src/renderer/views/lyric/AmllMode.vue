@@ -317,14 +317,23 @@ watch(
   },
 );
 
-const resolvedTextColor = computed(() =>
-  resolveLyricSkinColor(settings.value.textColor, AMLL_TEXT_COLOR_FALLBACK),
+const props = defineProps<{
+  /** 动态壁纸配色自带的歌词颜色；空值表示跟随皮肤设置。 */
+  colorOverride?: string;
+}>();
+
+// 壁纸配色命中时用它当歌词文字色，否则沿用皮肤设置。
+const textColorOverride = computed(() => props.colorOverride?.trim() ?? '');
+const resolvedTextColor = computed(
+  () =>
+    textColorOverride.value ||
+    resolveLyricSkinColor(settings.value.textColor, AMLL_TEXT_COLOR_FALLBACK),
 );
 // 歌词字体继承与颜色 CSS 变量的组装规则见 amll/hostStyle.ts。
 const playerAreaStyle = computed(() =>
   buildAmllHostStyle(
     settingStore.buildLyricFontFamily(),
-    settings.value.textColor,
+    textColorOverride.value || settings.value.textColor,
     resolvedTextColor.value,
   ),
 );
