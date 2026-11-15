@@ -13,6 +13,7 @@ import { getNativeWallpaper } from '../native/platform';
 import {
   createWallpaperSurface,
   destroyWallpaperSurface,
+  placeWallpaperSurface,
   resizeWallpaperSurface,
   resolveDisplays,
   surfaceMatchesDisplay,
@@ -125,15 +126,16 @@ const applyPolicy = () => {
     occludedFps: preset.occluded,
     stopOnFullscreen: settings.stopOnFullscreen,
   });
-  const changed =
-    !lastPolicy ||
-    lastPolicy.frameRate !== policy.frameRate ||
-    lastPolicy.visible !== policy.visible ||
-    lastPolicy.reason !== policy.reason;
   lastPolicy = policy;
-  if (!changed) return;
+  // 逐个窗口比对「已经下发过的策略」，而不是只跟上一轮的全局策略比：新建的窗口
+  // 是在上一轮下发之后才出现的，只比全局会把它漏掉，它就一直停在创建时的可见状态。
   for (const surface of surfaces.values()) {
     if (surface.win.isDestroyed()) continue;
+    const applied = surface.applied;
+    if (applied && applied.frameRate === policy.frameRate && applied.visible === policy.visible) {
+      continue;
+    }
+    surface.applied = { frameRate: policy.frameRate, visible: policy.visible };
     try {
       surface.win.webContents.setFrameRate(policy.frameRate);
       surface.win.webContents.setBackgroundThrottling(!policy.visible);
@@ -141,7 +143,11 @@ const applyPolicy = () => {
       log.warn('[Wallpaper] 设置帧率失败:', error);
     }
     // 隐藏的窗口 Chromium 不再合成，比降到 0fps 更省。
-    if (policy.visible && !surface.win.isVisible()) surface.win.showInactive();
+    if (policy.visible && !surface.win.isVisible()) {
+      surface.win.showInactive();
+      // 重新显示时 Chromium 会按屏幕坐标恢复 bounds，子窗口会偏一个宿主原点。
+      placeWallpaperSurface(surface);
+    }
     if (!policy.visible && surface.win.isVisible()) surface.win.hide();
   }
   broadcastState();
@@ -153,12 +159,95 @@ const handleOcclusion = (event: { coverage: number; fullscreen: boolean }) => {
   applyPolicy();
 };
 
+/**
+ * 桌面层被 Explorer 重建（比如「显示桌面」、切换虚拟桌面、Explorer 重启）时，
+ * 挂在它下面的窗口会被一起销毁，或者被系统藏起来。这里兜住这两种情况，
+ * 否则 surfaces 里留着一个死窗口，重建时又因为「这个显示器已经有了」被跳过，
+ * 壁纸就再也回不来了。
+ */
+const watchSurface = (surface: WallpaperSurface) => {
+  const id = surface.displayId;
+  surface.win.on('closed', () => {
+    // 主动销毁时 surfaces 里已经不是它了，不用管。
+    if (surfaces.get(id) !== surface) return;
+    surfaces.delete(id);
+    if (!enabled || quitting) return;
+    void runExclusive(rebuild).catch((error) => log.error('[Wallpaper] 重建失败:', error));
+  });
+  surface.win.on('hide', () => {
+    if (surface.win.isDestroyed()) return;
+    if (!lastPolicy?.visible) return;
+    // 不该隐藏却隐藏了（系统收起了桌面层），重新显示并按宿主坐标摆正。
+    surface.win.showInactive();
+    placeWallpaperSurface(surface);
+  });
+};
+
+/** 短时间内反复被销毁说明重建也不会好（例如桌面层一直被顶着），先停下来。 */
+const lossGuard = new Map<string, { count: number; at: number }>();
+const MAX_LOSS_REBUILDS = 3;
+const LOSS_WINDOW_MS = 60_000;
+
+/**
+ * 桌面层被 Explorer 重建时（「显示桌面」、切换虚拟桌面、Explorer 重启），挂在
+ * 它下面的子窗口会被系统直接销毁，Electron 侧可能还当它活着，导致重建时被
+ * 「这个显示器已经有了」跳过。这里把它从表里摘掉并重建一次。
+ */
+const handleSurfaceLost = (displayId: string) => {
+  const surface = surfaces.get(displayId);
+  if (!surface) return;
+  surfaces.delete(displayId);
+  try {
+    surface.monitor?.stop();
+  } catch (error) {
+    log.warn('[Wallpaper] 停止遮挡监控失败:', error);
+  }
+  surface.monitor = null;
+  surface.attached = false;
+  // 「窗口没了」只有在它本来就该开着的时候才值得重建：开关被关掉，或者这块屏
+  // 已经从设置里取消勾选，就只是把这条记录摘掉，不重启。
+  if (!enabled || quitting) return;
+  const stillWanted = resolveDisplays(settings.displayIds).some(
+    (display) => String(display.id) === displayId,
+  );
+  if (!stillWanted) {
+    log.info('[Wallpaper] 屏幕已不再启用壁纸，跳过重建', displayId);
+    return;
+  }
+  const now = Date.now();
+  const recent = lossGuard.get(displayId);
+  const tries = recent && now - recent.at < LOSS_WINDOW_MS ? recent.count + 1 : 1;
+  lossGuard.set(displayId, { count: tries, at: now });
+  if (tries > MAX_LOSS_REBUILDS) {
+    log.warn('[Wallpaper] 桌面层窗口反复消失，暂停自动重建', displayId);
+    return;
+  }
+  log.info('[Wallpaper] 桌面层窗口已被系统销毁，重建', displayId);
+  void runExclusive(rebuild).catch((error) => log.error('[Wallpaper] 重建失败:', error));
+};
+
 const createSurfacesFor = async (displays: Display[]) => {
+  const targets: Display[] = [];
   for (const display of displays) {
     const id = String(display.id);
-    if (surfaces.has(id)) continue;
-    const surface = await createWallpaperSurface(display, handleOcclusion);
-    if (surface) surfaces.set(id, surface);
+    if (surfaces.has(id)) {
+      const current = surfaces.get(id);
+      // 顺手清掉已经销毁、但还留在表里的窗口。
+      if (current && !current.win.isDestroyed()) continue;
+      surfaces.delete(id);
+    }
+    targets.push(display);
+  }
+  // 每个窗口都要单独加载一遍前端页面，串行会把启动时间乘以屏幕块数，这里并行建。
+  const created = await Promise.all(
+    targets.map((display) =>
+      createWallpaperSurface(display, handleOcclusion, () => handleSurfaceLost(String(display.id))),
+    ),
+  );
+  for (const surface of created) {
+    if (!surface) continue;
+    surfaces.set(surface.displayId, surface);
+    watchSurface(surface);
   }
 };
 
@@ -210,6 +299,7 @@ export const setWallpaperEnabled = (value: boolean): Promise<void> => {
   }
   // 开关状态先落地并广播：建窗口、挂载要几百毫秒，界面不该等它。
   enabled = value;
+  lossGuard.clear();
   setMainAppSetting('wallpaperEnabled', value);
   broadcastState();
   return runExclusive(async () => {
@@ -220,6 +310,8 @@ export const setWallpaperEnabled = (value: boolean): Promise<void> => {
 
 // 设置一律同步生效：建窗口、挂载要几百毫秒，界面不该等它。
 export const updateWallpaperSettings = (patch: Partial<WallpaperSettings>): WallpaperState => {
+  // 改了设置说明用户又想看到壁纸了，把「反复消失」的计数清掉重来。
+  lossGuard.clear();
   loadSettings();
   const next = normalizeWallpaperSettings({ ...settings, ...patch });
   const displaysChanged = next.displayIds.join(',') !== settings.displayIds.join(',');

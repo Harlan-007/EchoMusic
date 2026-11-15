@@ -17,6 +17,8 @@ export interface WallpaperSurface {
   attached: boolean;
   /** 这个窗口在该显示器上应占的屏幕矩形（屏幕坐标）。 */
   rect: { x: number; y: number; width: number; height: number };
+  /** 已经下发给这个窗口的省电策略；新建窗口从这里开始是空，必须补下发一次。 */
+  applied: { frameRate: number; visible: boolean } | null;
 }
 
 export interface WallpaperOcclusionEvent {
@@ -53,23 +55,31 @@ export const surfaceMatchesDisplay = (surface: WallpaperSurface, display: Displa
   );
 };
 
-/** 等首帧绘制完成再挂载：SetParent 之后 Chromium 才会按新父窗口合成。 */
+/**
+ * 等第一帧能显示就返回，不等整页加载完。ready-to-show 在 Chromium 画出首帧时
+ * 触发：dev 下整个前端要在壁纸窗口里重新加载一遍，等 did-finish-load 要好几秒，
+ * 而挂载只需要已经合成过一帧。1.5 秒还没出首帧就直接往下走，剩下的内容挂上去
+ * 之后继续加载。
+ */
 const waitForFirstPaint = (win: BrowserWindow): Promise<void> =>
   new Promise((resolve) => {
     let done = false;
     const finish = () => {
       if (done) return;
       done = true;
+      clearTimeout(timer);
       resolve();
     };
-    win.webContents.once('did-finish-load', () => setTimeout(finish, 60));
+    const timer = setTimeout(finish, 1500);
+    win.once('ready-to-show', finish);
     win.webContents.once('did-fail-load', finish);
-    setTimeout(finish, 4000);
   });
 
 export const createWallpaperSurface = async (
   display: Display,
   onOcclusion: (event: WallpaperOcclusionEvent) => void,
+  /** 窗口被系统销毁（桌面层重建）时回调，由主进程决定重建。 */
+  onLost: () => void,
 ): Promise<WallpaperSurface | null> => {
   const native = getNativeWallpaper();
   if (!native) {
@@ -120,7 +130,10 @@ export const createWallpaperSurface = async (
     fullscreen: false,
     attached: false,
     rect: bounds,
+    applied: null,
   };
+  // 监听要在 loadURL 之前挂上：ready-to-show 可能就在加载过程中触发，晚了就漏掉。
+  const painted = waitForFirstPaint(candidate);
   const dev = process.env.VITE_DEV_SERVER_URL;
   if (dev) {
     const url = new URL('index.html', dev);
@@ -129,11 +142,10 @@ export const createWallpaperSurface = async (
   } else {
     await candidate.loadFile(join(__dirname, '../../dist/index.html'), { hash: '/wallpaper' });
   }
-  await waitForFirstPaint(candidate);
-  // 先让窗口完成首帧合成再挂进桌面层：直接挂载时 Chromium 还没出过画面，
-  // 桌面上会出现一块纯黑区域，直到有下一次重绘。
+  await painted;
+  // 首帧已经有了，再让窗口显示一小会儿，避免刚挂上去时桌面上出现一块空白。
   candidate.showInactive();
-  await new Promise((resolve) => setTimeout(resolve, 120));
+  await new Promise((resolve) => setTimeout(resolve, 60));
   try {
     const handle = nativeHandle(candidate);
     native.wallpaperAttach(handle);
@@ -153,6 +165,12 @@ export const createWallpaperSurface = async (
         '）',
     );
     surface.monitor = new native.WallpaperMonitor(handle, 500, (state) => {
+      // 只认明确的 false：原生模块版本不一致时字段可能读成 undefined，
+      // 用 !state.alive 会把它当成窗口没了，进而每 5 秒重建一次。
+      if (state.alive === false) {
+        onLost();
+        return;
+      }
       surface.coverage = state.coverage;
       surface.fullscreen = state.fullscreen;
       onOcclusion({ coverage: state.coverage, fullscreen: state.fullscreen });
@@ -166,6 +184,23 @@ export const createWallpaperSurface = async (
 };
 
 /**
+ * 按记录的屏幕矩形把窗口重新摆一遍。挂载后它是桌面宿主的子窗口，而 Chromium
+ * 在窗口重新显示时仍会按屏幕坐标恢复自己那份 bounds，落点就会整整偏一个宿主
+ * 原点，所以每次把它显示出来之后都要按父窗口坐标重新摆一次。
+ */
+export const placeWallpaperSurface = (surface: WallpaperSurface): void => {
+  if (!surface.attached || surface.win.isDestroyed()) return;
+  const native = getNativeWallpaper();
+  if (!native) return;
+  try {
+    const { x, y, width, height } = surface.rect;
+    native.wallpaperResize(nativeHandle(surface.win), x, y, width, height);
+  } catch (error) {
+    log.warn('[Wallpaper] 摆放窗口失败:', error);
+  }
+};
+
+/**
  * 显示器矩形变化（任务栏显示/隐藏、改分辨率、改缩放）后按新矩形摆一遍。
  * 窗口只是换尺寸，内容不重建，歌词和播放不会中断。
  */
@@ -173,29 +208,14 @@ export const resizeWallpaperSurface = (surface: WallpaperSurface, display: Displ
   if (surface.win.isDestroyed()) return;
   const bounds = displayBounds(display);
   surface.rect = bounds;
-  surface.win.setBounds(bounds);
-  const actual = surface.win.getBounds();
-  if (
-    actual.x !== bounds.x ||
-    actual.y !== bounds.y ||
-    actual.width !== bounds.width ||
-    actual.height !== bounds.height
-  ) {
-    log.warn('[Wallpaper] 窗口尺寸被系统夹住', actual, '目标', bounds);
+  if (!surface.attached) {
+    // 还没挂到桌面层时它就是普通顶层窗口，交给 Electron 摆。
+    surface.win.setBounds(bounds);
+    return;
   }
-  const native = getNativeWallpaper();
-  if (!native || !surface.attached) return;
-  try {
-    native.wallpaperResize(
-      nativeHandle(surface.win),
-      bounds.x,
-      bounds.y,
-      bounds.width,
-      bounds.height,
-    );
-  } catch (error) {
-    log.warn('[Wallpaper] 调整尺寸失败:', error);
-  }
+  // 挂载之后它是桌面宿主的子窗口：Electron 的 setBounds 会把屏幕坐标直接当
+  // 子窗口坐标用，落点整整偏一个宿主原点（还会被再夹一次），所以只走原生。
+  placeWallpaperSurface(surface);
 };
 
 export const destroyWallpaperSurface = (surface: WallpaperSurface): void => {

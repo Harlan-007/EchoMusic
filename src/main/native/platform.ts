@@ -150,6 +150,8 @@ export function getNativeTaskbarLyric(): NativeTaskbarLyric | null {
 export interface NativeWallpaperOcclusion {
   coverage: number;
   fullscreen: boolean;
+  /** 窗口句柄是否还有效；桌面层重建后子窗口会被销毁。 */
+  alive: boolean;
 }
 
 export interface NativeWallpaperMonitor {

@@ -14,7 +14,7 @@ use std::{
     mem::size_of,
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     thread,
     time::Duration,
@@ -39,14 +39,11 @@ type Callback =
 pub struct WallpaperOcclusion {
     pub coverage: f64,
     pub fullscreen: bool,
+    /// 窗口句柄是否还有效。桌面层被 Explorer 重建时子窗口会被一起销毁，
+    /// 而 Electron 侧不一定收到通知，靠这里报给主进程去重建。
+    pub alive: bool,
 }
 
-/// 当前挂载的桌面宿主（WorkerW）。子窗口坐标相对它，重置尺寸时要换算。
-static HOST: Mutex<Option<isize>> = Mutex::new(None);
-
-/// 最近一次摆放的**屏幕坐标**矩形。Chromium 会在窗口显示/隐藏、布局变化时
-/// 用它自己那份（被夹到工作区的）bounds 覆盖回来，所以这里留一份真值，
-/// 由遮挡监控线程顺带校正，左右就不会再露出去。
 const DESKTOP_CLASSES: [&str; 6] = [
     "Progman",
     "WorkerW",
@@ -171,28 +168,23 @@ pub fn wallpaper_attach(handle: String) -> napi::Result<()> {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
         )
         .ok();
-        if let Ok(mut guard) = HOST.lock() {
-            *guard = Some(host.0 as isize);
-        }
         Ok(())
     }
 }
 
-unsafe fn host_origin() -> (i32, i32) {
-    let host = HOST
-        .lock()
-        .ok()
-        .and_then(|guard| *guard)
-        .filter(|value| *value != 0);
+/// 子窗口坐标相对**当前父窗口**换算。父窗口每次都现查：桌面宿主被 Explorer
+/// 重建、窗口换了父窗口、或者挂载时机和摆放时机交错时，缓存下来的句柄会过期。
+unsafe fn parent_origin(child: HWND) -> (i32, i32) {
+    let parent = GetParent(child).unwrap_or_default();
     let mut origin = RECT::default();
-    if let Some(host) = host {
-        let _ = GetWindowRect(HWND(host as *mut c_void), &mut origin);
+    if !parent.0.is_null() {
+        let _ = GetWindowRect(parent, &mut origin);
     }
     (origin.left, origin.top)
 }
 
 unsafe fn apply_rect(child: HWND, x: i32, y: i32, width: i32, height: i32) {
-    let (origin_x, origin_y) = host_origin();
+    let (origin_x, origin_y) = parent_origin(child);
     SetWindowPos(
         child,
         Some(HWND_BOTTOM),
@@ -218,7 +210,6 @@ pub fn wallpaper_resize(
     Ok(())
 }
 
-
 /// 解挂：先隐藏再 SetParent(None)，与任务栏歌词的退出顺序一致。
 #[napi]
 pub fn wallpaper_detach(handle: String) -> napi::Result<()> {
@@ -236,9 +227,6 @@ pub fn wallpaper_detach(handle: String) -> napi::Result<()> {
         let mask = (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as isize;
         SetWindowLongPtrW(child, GWL_EXSTYLE, ex & !mask);
     }
-    if let Ok(mut guard) = HOST.lock() {
-        *guard = None;
-    }
     Ok(())
 }
 
@@ -253,6 +241,7 @@ unsafe fn measure(child: HWND) -> WallpaperOcclusion {
     let none = WallpaperOcclusion {
         coverage: 0.0,
         fullscreen: false,
+        alive: true,
     };
     let monitor = MonitorFromWindow(child, MONITOR_DEFAULTTONEAREST);
     let mut info = MONITORINFO {
@@ -307,6 +296,7 @@ unsafe fn measure(child: HWND) -> WallpaperOcclusion {
     WallpaperOcclusion {
         coverage: (coverage * 100.0).round() / 100.0,
         fullscreen: maximized || coverage >= 0.995,
+        alive: true,
     }
 }
 
@@ -314,6 +304,19 @@ fn run(child: usize, stopped: Arc<AtomicBool>, interval: Arc<AtomicI32>, callbac
     let hwnd = HWND(child as *mut c_void);
     let mut last: Option<(i32, bool)> = None;
     while !stopped.load(Ordering::Acquire) {
+        // 句柄没了说明桌面层被重建（显示桌面、切虚拟桌面、Explorer 重启），
+        // 挂在它下面的子窗口会被系统直接销毁；这个线程本来就在跑，顺手报一次。
+        if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+            let _ = callback.call(
+                WallpaperOcclusion {
+                    coverage: 0.0,
+                    fullscreen: false,
+                    alive: false,
+                },
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+            break;
+        }
         let state = unsafe { measure(hwnd) };
         let key = ((state.coverage * 100.0) as i32, state.fullscreen);
         if last != Some(key) {
@@ -381,6 +384,4 @@ impl WallpaperMonitor {
         self.child.to_string()
     }
 }
-
-
 
